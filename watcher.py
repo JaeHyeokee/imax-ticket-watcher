@@ -47,8 +47,16 @@ def load_state():
             data["seen"] = set(data.get("seen", []))
             data.setdefault("seat_counts", {})
             data.setdefault("active_dates", {})
+            data.setdefault("full_scan_cursor", {})
             return data
-    return {"seen": set(), "open_dates": {}, "seat_counts": {}, "active_dates": {}, "initialized": False}
+    return {
+        "seen": set(),
+        "open_dates": {},
+        "seat_counts": {},
+        "active_dates": {},
+        "full_scan_cursor": {},
+        "initialized": False,
+    }
 
 
 def save_state(state):
@@ -57,6 +65,7 @@ def save_state(state):
         "open_dates": state["open_dates"],
         "seat_counts": state["seat_counts"],
         "active_dates": state["active_dates"],
+        "full_scan_cursor": state["full_scan_cursor"],
         "initialized": state["initialized"],
     }
     with open(STATE_PATH, "w", encoding="utf-8") as f:
@@ -280,9 +289,14 @@ def poll_once(config, state, do_full_scan):
         if active_dates:
             scan_dates(config, state, theater, active_dates, notify=True)
 
-        # 오픈 감시: 예매 가능한 전체 기간을 다시 훑어서 놓친 신규 상영이 없는지 확인 (요청 많음 -> 긴 주기로 실행)
-        if do_full_scan:
-            scan_dates(config, state, theater, new_dates, notify=True)
+        # 오픈 감시: 예매 가능한 전체 기간을 다시 훑어서 놓친 신규 상영이 없는지 확인
+        # 날짜를 한 번에 다 훑지 않고, 매번 일부(chunk)씩만 순환하며 훑어서 한 사이클이 길어지는 것을 방지
+        if do_full_scan and new_dates:
+            chunk_size = config.get("full_scan_chunk_size", 10)
+            cursor = state["full_scan_cursor"].get(site_no, 0) % len(new_dates)
+            chunk = (new_dates[cursor:] + new_dates[:cursor])[:chunk_size]
+            scan_dates(config, state, theater, chunk, notify=True)
+            state["full_scan_cursor"][site_no] = (cursor + len(chunk)) % len(new_dates)
 
     save_state(state)
 
@@ -295,13 +309,14 @@ def main():
         initialize(config, state)
 
     cancel_check_interval = config.get("cancel_check_interval_sec", 8)
-    full_scan_interval = config.get("full_scan_interval_sec", 300)
+    full_scan_interval = config.get("full_scan_interval_sec", 30)
+    full_scan_chunk_size = config.get("full_scan_chunk_size", 10)
     log.info(
         f"감시 시작 (취소표 확인 주기: {cancel_check_interval}s, "
-        f"전체 오픈 재검사 주기: {full_scan_interval}s)"
+        f"전체 오픈 재검사 주기: {full_scan_interval}s, 회당 {full_scan_chunk_size}일씩 순환 조회)"
     )
 
-    last_full_scan = None  # None -> 시작 직후 1회는 무조건 전체 재검사
+    last_full_scan = None  # None -> 시작 직후 1회는 무조건 첫 청크 조회
 
     while True:
         now = time.monotonic()
