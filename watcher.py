@@ -1,5 +1,6 @@
 import json
 import random
+import threading
 import time
 import logging
 import urllib.request
@@ -203,6 +204,11 @@ def format_cancel_notification(theater_name, session, prev_free, new_free):
 
 
 def send_telegram(config, text):
+    """텔레그램 응답을 기다리지 않고 별도 스레드에서 비동기로 전송 (감시 루프가 멈추지 않도록)."""
+    threading.Thread(target=_send_telegram_sync, args=(config, text), daemon=True).start()
+
+
+def _send_telegram_sync(config, text):
     token = config["telegram"]["bot_token"]
     chat_id = config["telegram"]["chat_id"]
     url = f"https://api.telegram.org/bot{token}/sendMessage"
