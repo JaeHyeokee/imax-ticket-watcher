@@ -73,12 +73,12 @@ def save_state(state):
         json.dump(serializable, f, ensure_ascii=False, indent=2)
 
 
-# 취소표 감시(added/active_dates)는 반응 속도가 중요해서 지터 폭을 좁게,
-# 전체 오픈 재검사는 덜 급하니 지터 폭을 넓게 줘서 요청 리듬이 기계적으로 보이지 않게 함.
+# 연속 요청이 한 순간에 겹치지 않도록 약간의 지연을 둠 (서버 부하 완화 목적).
+# 취소표 감시(added/active_dates)는 반응 속도가 중요해서 폭을 좁게, 전체 오픈 재검사는 덜 급하니 폭을 넓게 둠.
 CANCEL_JITTER_RANGE = (0.4, 1.2)
 FULL_SCAN_JITTER_RANGE = (0.6, 2.5)
 
-# 폴링 루프 자체의 대기 시간에도 편차를 줘서 "정확히 N초마다"인 기계적인 리듬을 피함.
+# 폴링 루프 대기 시간에도 약간의 편차를 둬서 매 사이클 요청이 정확히 같은 순간에 뭉치지 않게 함.
 CANCEL_INTERVAL_JITTER_RATIO = 0.15
 FULL_SCAN_INTERVAL_JITTER_RATIO = 0.35
 
@@ -295,6 +295,16 @@ def poll_once(config, state, do_full_scan):
         request_jitter()
         added = [d for d in new_dates if d not in prev_dates]
         state["open_dates"][site_no] = new_dates
+
+        # active_dates 가지치기: 더 이상 예매 가능 목록에 없는(상영 종료/마감된) 날짜는 감시 대상에서 제거.
+        # 그래야 취소표 감시가 시간이 지날수록 요청량이 계속 늘어나지 않음.
+        prev_active = state["active_dates"].get(site_no, [])
+        new_dates_set = set(new_dates)
+        pruned_active = [d for d in prev_active if d in new_dates_set]
+        expired = [d for d in prev_active if d not in new_dates_set]
+        if expired:
+            log.info(f"{theater['name']}: 마감/종료된 날짜 감시 해제 {expired}")
+        state["active_dates"][site_no] = pruned_active
 
         if added:
             log.info(f"{theater['name']}: 예매 가능 날짜 확장 감지 {added}")
