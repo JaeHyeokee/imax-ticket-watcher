@@ -72,9 +72,19 @@ def save_state(state):
         json.dump(serializable, f, ensure_ascii=False, indent=2)
 
 
-def request_jitter():
+# 취소표 감시(added/active_dates)는 반응 속도가 중요해서 지터 폭을 좁게,
+# 전체 오픈 재검사는 덜 급하니 지터 폭을 넓게 줘서 요청 리듬이 기계적으로 보이지 않게 함.
+CANCEL_JITTER_RANGE = (0.4, 1.2)
+FULL_SCAN_JITTER_RANGE = (0.6, 2.5)
+
+# 폴링 루프 자체의 대기 시간에도 편차를 줘서 "정확히 N초마다"인 기계적인 리듬을 피함.
+CANCEL_INTERVAL_JITTER_RATIO = 0.15
+FULL_SCAN_INTERVAL_JITTER_RATIO = 0.35
+
+
+def request_jitter(jitter_range=CANCEL_JITTER_RANGE):
     """연속 요청 사이에 랜덤 딜레이를 줘서 짧은 시간에 요청이 몰리는 것을 완화."""
-    time.sleep(random.uniform(0.4, 1.0))
+    time.sleep(random.uniform(*jitter_range))
 
 
 def fetch_json(url, retries=3, timeout=10):
@@ -206,7 +216,7 @@ def send_telegram(config, text):
         log.error(f"텔레그램 알림 전송 실패: {e}")
 
 
-def scan_dates(config, state, theater, dates, notify):
+def scan_dates(config, state, theater, dates, notify, jitter_range=CANCEL_JITTER_RANGE):
     site_no = theater["site_no"]
     name = theater["name"]
     screen_keywords = config.get("screens", ["IMAX"])
@@ -219,7 +229,7 @@ def scan_dates(config, state, theater, dates, notify):
     for ymd in dates:
         red_day = is_red_day(ymd, holidays)
         sessions = get_sessions(site_no, ymd)
-        request_jitter()
+        request_jitter(jitter_range)
         date_has_match = False
         for session in sessions:
             if not matches_screen(session, screen_keywords):
@@ -295,7 +305,7 @@ def poll_once(config, state, do_full_scan):
             chunk_size = config.get("full_scan_chunk_size", 10)
             cursor = state["full_scan_cursor"].get(site_no, 0) % len(new_dates)
             chunk = (new_dates[cursor:] + new_dates[:cursor])[:chunk_size]
-            scan_dates(config, state, theater, chunk, notify=True)
+            scan_dates(config, state, theater, chunk, notify=True, jitter_range=FULL_SCAN_JITTER_RANGE)
             state["full_scan_cursor"][site_no] = (cursor + len(chunk)) % len(new_dates)
 
     save_state(state)
@@ -317,17 +327,25 @@ def main():
     )
 
     last_full_scan = None  # None -> 시작 직후 1회는 무조건 첫 청크 조회
+    next_full_scan_interval = full_scan_interval  # 매번 지터를 넣어 재계산되는 실제 대기 시간
 
     while True:
         now = time.monotonic()
-        do_full_scan = last_full_scan is None or (now - last_full_scan) >= full_scan_interval
+        do_full_scan = last_full_scan is None or (now - last_full_scan) >= next_full_scan_interval
         try:
             poll_once(config, state, do_full_scan)
             if do_full_scan:
                 last_full_scan = now
+                next_full_scan_interval = full_scan_interval * random.uniform(
+                    1 - FULL_SCAN_INTERVAL_JITTER_RATIO, 1 + FULL_SCAN_INTERVAL_JITTER_RATIO
+                )
         except Exception as e:
             log.exception(f"폴링 중 오류 발생: {e}")
-        time.sleep(cancel_check_interval)
+
+        sleep_for = cancel_check_interval * random.uniform(
+            1 - CANCEL_INTERVAL_JITTER_RATIO, 1 + CANCEL_INTERVAL_JITTER_RATIO
+        )
+        time.sleep(sleep_for)
 
 
 if __name__ == "__main__":
