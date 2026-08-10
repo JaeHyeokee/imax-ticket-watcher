@@ -1,4 +1,5 @@
 import json
+import random
 import time
 import logging
 import urllib.request
@@ -60,6 +61,11 @@ def save_state(state):
     }
     with open(STATE_PATH, "w", encoding="utf-8") as f:
         json.dump(serializable, f, ensure_ascii=False, indent=2)
+
+
+def request_jitter():
+    """연속 요청 사이에 랜덤 딜레이를 줘서 짧은 시간에 요청이 몰리는 것을 완화."""
+    time.sleep(random.uniform(0.4, 1.0))
 
 
 def fetch_json(url, retries=3, timeout=10):
@@ -204,6 +210,7 @@ def scan_dates(config, state, theater, dates, notify):
     for ymd in dates:
         red_day = is_red_day(ymd, holidays)
         sessions = get_sessions(site_no, ymd)
+        request_jitter()
         date_has_match = False
         for session in sessions:
             if not matches_screen(session, screen_keywords):
@@ -256,12 +263,13 @@ def initialize(config, state):
 
 
 def poll_once(config, state, cycle_count):
-    full_scan_every = config.get("full_scan_every_n_cycles", 6)
+    full_scan_every = config.get("full_scan_every_n_cycles", 15)
 
     for theater in config["theaters"]:
         site_no = theater["site_no"]
         prev_dates = set(state["open_dates"].get(site_no, []))
         new_dates = get_open_dates(site_no)
+        request_jitter()
         added = [d for d in new_dates if d not in prev_dates]
         state["open_dates"][site_no] = new_dates
 
@@ -288,7 +296,7 @@ def main():
     if not state["initialized"]:
         initialize(config, state)
 
-    interval = config.get("poll_interval_sec", 10)
+    interval = config.get("poll_interval_sec", 20)
     cycle = 0
     log.info(f"감시 시작 (poll interval: {interval}s)")
 
