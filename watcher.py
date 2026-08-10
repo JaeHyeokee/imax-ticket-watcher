@@ -173,8 +173,7 @@ def format_cancel_notification(theater_name, session, prev_free, new_free):
         f"영화: {movie}\n"
         f"상영관: {screen}\n"
         f"일시: {date_fmt} {time_fmt}\n"
-        f"잔여좌석: {new_free} / {total} (+{freed}석)\n"
-        f"※ 정확히 몇 번 좌석인지는 알 수 없습니다. CGV 앱/사이트에서 바로 확인하세요."
+        f"잔여좌석: {new_free} / {total} (+{freed}석)"
     )
 
 
