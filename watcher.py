@@ -262,9 +262,7 @@ def initialize(config, state):
     log.info("초기화 완료. 이제부터 새로운 상영이 열리면 알림을 보냅니다.")
 
 
-def poll_once(config, state, cycle_count):
-    full_scan_every = config.get("full_scan_every_n_cycles", 15)
-
+def poll_once(config, state, do_full_scan):
     for theater in config["theaters"]:
         site_no = theater["site_no"]
         prev_dates = set(state["open_dates"].get(site_no, []))
@@ -277,13 +275,13 @@ def poll_once(config, state, cycle_count):
             log.info(f"{theater['name']}: 예매 가능 날짜 확장 감지 {added}")
             scan_dates(config, state, theater, added, notify=True)
 
-        # 매 사이클: 이미 감시 대상으로 확인된 날짜만 빠르게 재확인 (취소표 감지용)
+        # 취소표 감시: 이미 감시 대상으로 확인된 날짜만 빠르게 재확인 (요청 적음 -> 짧은 주기로 실행)
         active_dates = state["active_dates"].get(site_no, [])
         if active_dates:
             scan_dates(config, state, theater, active_dates, notify=True)
 
-        # 가끔(+ 시작 직후 1회): 예매 가능한 전체 기간을 다시 훑어서 놓친 신규 상영이 없는지 확인
-        if cycle_count == 1 or cycle_count % full_scan_every == 0:
+        # 오픈 감시: 예매 가능한 전체 기간을 다시 훑어서 놓친 신규 상영이 없는지 확인 (요청 많음 -> 긴 주기로 실행)
+        if do_full_scan:
             scan_dates(config, state, theater, new_dates, notify=True)
 
     save_state(state)
@@ -296,17 +294,25 @@ def main():
     if not state["initialized"]:
         initialize(config, state)
 
-    interval = config.get("poll_interval_sec", 20)
-    cycle = 0
-    log.info(f"감시 시작 (poll interval: {interval}s)")
+    cancel_check_interval = config.get("cancel_check_interval_sec", 8)
+    full_scan_interval = config.get("full_scan_interval_sec", 300)
+    log.info(
+        f"감시 시작 (취소표 확인 주기: {cancel_check_interval}s, "
+        f"전체 오픈 재검사 주기: {full_scan_interval}s)"
+    )
+
+    last_full_scan = None  # None -> 시작 직후 1회는 무조건 전체 재검사
 
     while True:
-        cycle += 1
+        now = time.monotonic()
+        do_full_scan = last_full_scan is None or (now - last_full_scan) >= full_scan_interval
         try:
-            poll_once(config, state, cycle)
+            poll_once(config, state, do_full_scan)
+            if do_full_scan:
+                last_full_scan = now
         except Exception as e:
             log.exception(f"폴링 중 오류 발생: {e}")
-        time.sleep(interval)
+        time.sleep(cancel_check_interval)
 
 
 if __name__ == "__main__":
