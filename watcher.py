@@ -5,6 +5,7 @@ import time
 import logging
 import urllib.request
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -81,6 +82,11 @@ FULL_SCAN_JITTER_RANGE = (0.6, 2.5)
 # 폴링 루프 대기 시간에도 약간의 편차를 둬서 매 사이클 요청이 정확히 같은 순간에 뭉치지 않게 함.
 CANCEL_INTERVAL_JITTER_RATIO = 0.15
 FULL_SCAN_INTERVAL_JITTER_RATIO = 0.35
+
+# 취소표 재확인(active_dates)은 감시 중인 날짜 수만큼 순차 조회하면 한 바퀴가 너무 길어지므로
+# 소수의 동시 요청으로 병렬 처리. 너무 늘리면 순간적으로 요청이 몰려 비정상 접속으로 보일 위험이 커지니
+# 작은 값으로 제한.
+CANCEL_MAX_WORKERS = 4
 
 
 def request_jitter(jitter_range=CANCEL_JITTER_RANGE):
@@ -222,7 +228,7 @@ def _send_telegram_sync(config, text):
         log.error(f"텔레그램 알림 전송 실패: {e}")
 
 
-def scan_dates(config, state, theater, dates, notify, jitter_range=CANCEL_JITTER_RANGE):
+def scan_dates(config, state, theater, dates, notify, jitter_range=CANCEL_JITTER_RANGE, parallel=False):
     site_no = theater["site_no"]
     name = theater["name"]
     screen_keywords = config.get("screens", ["IMAX"])
@@ -232,7 +238,7 @@ def scan_dates(config, state, theater, dates, notify, jitter_range=CANCEL_JITTER
     holidays = set(config.get("holidays", []))
     active = set(state["active_dates"].get(site_no, []))
 
-    for ymd in dates:
+    def process_date(ymd):
         red_day = is_red_day(ymd, holidays)
         sessions = get_sessions(site_no, ymd)
         request_jitter(jitter_range)
@@ -271,6 +277,14 @@ def scan_dates(config, state, theater, dates, notify, jitter_range=CANCEL_JITTER
 
         if date_has_match:
             active.add(ymd)
+
+    if parallel and len(dates) > 1:
+        max_workers = min(config.get("cancel_max_workers", CANCEL_MAX_WORKERS), len(dates))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            list(executor.map(process_date, dates))
+    else:
+        for ymd in dates:
+            process_date(ymd)
 
     state["active_dates"][site_no] = sorted(active)
 
@@ -311,9 +325,10 @@ def poll_once(config, state, do_full_scan):
             scan_dates(config, state, theater, added, notify=True)
 
         # 취소표 감시: 이미 감시 대상으로 확인된 날짜만 빠르게 재확인 (요청 적음 -> 짧은 주기로 실행)
+        # 날짜 수가 많아지면 순차 조회로는 한 바퀴가 길어지므로 소수의 동시 요청으로 병렬 처리.
         active_dates = state["active_dates"].get(site_no, [])
         if active_dates:
-            scan_dates(config, state, theater, active_dates, notify=True)
+            scan_dates(config, state, theater, active_dates, notify=True, parallel=True)
 
         # 오픈 감시: 예매 가능한 전체 기간을 다시 훑어서 놓친 신규 상영이 없는지 확인
         # 날짜를 한 번에 다 훑지 않고, 매번 일부(chunk)씩만 순환하며 훑어서 한 사이클이 길어지는 것을 방지
