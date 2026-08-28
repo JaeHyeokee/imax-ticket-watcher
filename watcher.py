@@ -1,3 +1,4 @@
+import argparse
 import json
 import random
 import threading
@@ -45,12 +46,12 @@ def load_config():
 def load_state():
     if STATE_PATH.exists():
         with open(STATE_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            data["seen"] = set(data.get("seen", []))
-            data.setdefault("seat_counts", {})
-            data.setdefault("active_dates", {})
-            data.setdefault("full_scan_cursor", {})
-            return data
+            raw_state = json.load(f)
+            raw_state["seen"] = set(raw_state.get("seen", []))
+            raw_state.setdefault("seat_counts", {})
+            raw_state.setdefault("active_dates", {})
+            raw_state.setdefault("full_scan_cursor", {})
+            return raw_state
     return {
         "seen": set(),
         "open_dates": {},
@@ -108,18 +109,18 @@ def fetch_json(url, retries=3, timeout=10):
 
 def get_open_dates(site_no):
     url = f"{API_BASE}/searchSiteScnscYmdListBySite?coCd={CO_CD}&siteNo={site_no}"
-    data = fetch_json(url)
-    if not data or data.get("statusCode") != 0:
+    response = fetch_json(url)
+    if not response or response.get("statusCode") != 0:
         return []
-    return [row["scnYmd"] for row in data.get("data") or []]
+    return [row["scnYmd"] for row in response.get("data") or []]
 
 
 def get_sessions(site_no, scn_ymd):
     url = f"{API_BASE}/searchMovScnInfo?coCd={CO_CD}&siteNo={site_no}&scnYmd={scn_ymd}&rtctlScopCd=08"
-    data = fetch_json(url)
-    if not data or data.get("statusCode") != 0:
+    response = fetch_json(url)
+    if not response or response.get("statusCode") != 0:
         return []
-    return data.get("data") or []
+    return response.get("data") or []
 
 
 def matches_screen(session, screen_keywords):
@@ -237,8 +238,16 @@ def scan_dates(config, state, theater, dates, notify, jitter_range=CANCEL_JITTER
     weekday_start_time = config.get("weekday_start_time", "")
     holidays = set(config.get("holidays", []))
     active = set(state["active_dates"].get(site_no, []))
+    changed = False
 
+    # parallel=True일 때 ThreadPoolExecutor로 여러 스레드가 이 클로저를 동시에 실행하며
+    # state["seen"]/state["seat_counts"]/active/changed를 건드림. 각 스레드는 서로 다른
+    # ymd의 세션(따라서 서로 다른 session_key)에만 쓰기 때문에 lock 없이 안전함. changed는
+    # 여러 스레드가 동시에 건드려도 항상 같은 값(True)만 대입하는 멱등 쓰기라 마찬가지로
+    # 안전함. 같은 키를 여러 스레드가 동시에 쓰게 되는 변경을 하려면 lock 도입을 함께
+    # 검토해야 함.
     def process_date(ymd):
+        nonlocal changed
         red_day = is_red_day(ymd, holidays)
         sessions = get_sessions(site_no, ymd)
         request_jitter(jitter_range)
@@ -253,6 +262,7 @@ def scan_dates(config, state, theater, dates, notify, jitter_range=CANCEL_JITTER
             date_has_match = True
             key = session_key(session)
             free = int(session.get("frSeatCnt") or 0)
+            prev_seat_count = state["seat_counts"].get(key)
 
             if key not in state["seen"]:
                 state["seen"].add(key)
@@ -262,7 +272,7 @@ def scan_dates(config, state, theater, dates, notify, jitter_range=CANCEL_JITTER
                     log.info(f"새 상영 발견 -> {name} {session.get('movNm')} {date_fmt} {time_fmt}")
                     send_telegram(config, text)
             else:
-                prev = state["seat_counts"].get(key, free)
+                prev = prev_seat_count if prev_seat_count is not None else free
                 if free > prev:
                     if notify and free > min_alert_seats:
                         text = format_cancel_notification(name, session, prev, free)
@@ -273,10 +283,13 @@ def scan_dates(config, state, theater, dates, notify, jitter_range=CANCEL_JITTER
                         )
                         send_telegram(config, text)
 
-            state["seat_counts"][key] = free
+            if prev_seat_count != free:
+                state["seat_counts"][key] = free
+                changed = True
 
-        if date_has_match:
+        if date_has_match and ymd not in active:
             active.add(ymd)
+            changed = True
 
     if parallel and len(dates) > 1:
         max_workers = min(config.get("cancel_max_workers", CANCEL_MAX_WORKERS), len(dates))
@@ -287,6 +300,7 @@ def scan_dates(config, state, theater, dates, notify, jitter_range=CANCEL_JITTER
             process_date(ymd)
 
     state["active_dates"][site_no] = sorted(active)
+    return changed
 
 
 def initialize(config, state):
@@ -301,48 +315,97 @@ def initialize(config, state):
     log.info("초기화 완료. 이제부터 새로운 상영이 열리면 알림을 보냅니다.")
 
 
-def poll_once(config, state, do_full_scan):
+def prune_expired_sessions(state, site_no, open_dates_set):
+    """마감되어 더 이상 예매 가능 목록에 없는 날짜의 seen/seat_counts 항목을 제거.
+    active_dates 가지치기와 같은 목적 — 오래 켜둘수록 state.json이 무한정 커지는 것을 방지."""
+    prefix = f"{site_no}|"
+    expired_keys = [
+        key for key in state["seen"]
+        if key.startswith(prefix) and key.split("|")[1] not in open_dates_set
+    ]
+    for key in expired_keys:
+        state["seen"].discard(key)
+        state["seat_counts"].pop(key, None)
+    return expired_keys
+
+
+def poll_once(config, state, do_full_scan, watch_open=True, watch_cancel=True):
+    state_changed = False
+
     for theater in config["theaters"]:
         site_no = theater["site_no"]
         prev_dates = set(state["open_dates"].get(site_no, []))
         new_dates = get_open_dates(site_no)
         request_jitter()
         added = [d for d in new_dates if d not in prev_dates]
+        new_dates_set = set(new_dates)
         state["open_dates"][site_no] = new_dates
+        if new_dates_set != prev_dates:
+            state_changed = True
 
         # active_dates 가지치기: 더 이상 예매 가능 목록에 없는(상영 종료/마감된) 날짜는 감시 대상에서 제거.
-        # 그래야 취소표 감시가 시간이 지날수록 요청량이 계속 늘어나지 않음.
+        # 그래야 취소표 감시가 시간이 지날수록 요청량이 계속 늘어나지 않음. watch_cancel이 꺼져 있어도
+        # active_dates 목록 자체는 계속 최신 상태로 유지해야 나중에 다시 켰을 때 정상 동작하므로 항상 수행.
         prev_active = state["active_dates"].get(site_no, [])
-        new_dates_set = set(new_dates)
         pruned_active = [d for d in prev_active if d in new_dates_set]
         expired = [d for d in prev_active if d not in new_dates_set]
         if expired:
             log.info(f"{theater['name']}: 마감/종료된 날짜 감시 해제 {expired}")
+            state_changed = True
         state["active_dates"][site_no] = pruned_active
 
-        if added:
+        # seen/seat_counts 가지치기: 위 active_dates 가지치기와 같은 이유로, 마감된 날짜의
+        # 감시 기록도 함께 제거해야 state.json이 계속 커지는 것을 막을 수 있음.
+        expired_sessions = prune_expired_sessions(state, site_no, new_dates_set)
+        if expired_sessions:
+            log.info(f"{theater['name']}: 마감된 날짜의 감시 기록 {len(expired_sessions)}건 정리")
+            state_changed = True
+
+        if watch_open and added:
             log.info(f"{theater['name']}: 예매 가능 날짜 확장 감지 {added}")
-            scan_dates(config, state, theater, added, notify=True)
+            if scan_dates(config, state, theater, added, notify=True):
+                state_changed = True
 
         # 취소표 감시: 이미 감시 대상으로 확인된 날짜만 빠르게 재확인 (요청 적음 -> 짧은 주기로 실행)
         # 날짜 수가 많아지면 순차 조회로는 한 바퀴가 길어지므로 소수의 동시 요청으로 병렬 처리.
         active_dates = state["active_dates"].get(site_no, [])
-        if active_dates:
-            scan_dates(config, state, theater, active_dates, notify=True, parallel=True)
+        if watch_cancel and active_dates:
+            if scan_dates(config, state, theater, active_dates, notify=True, parallel=True):
+                state_changed = True
 
         # 오픈 감시: 예매 가능한 전체 기간을 다시 훑어서 놓친 신규 상영이 없는지 확인
         # 날짜를 한 번에 다 훑지 않고, 매번 일부(chunk)씩만 순환하며 훑어서 한 사이클이 길어지는 것을 방지
-        if do_full_scan and new_dates:
+        if watch_open and do_full_scan and new_dates:
             chunk_size = config.get("full_scan_chunk_size", 10)
             cursor = state["full_scan_cursor"].get(site_no, 0) % len(new_dates)
             chunk = (new_dates[cursor:] + new_dates[:cursor])[:chunk_size]
-            scan_dates(config, state, theater, chunk, notify=True, jitter_range=FULL_SCAN_JITTER_RANGE)
+            if scan_dates(config, state, theater, chunk, notify=True, jitter_range=FULL_SCAN_JITTER_RANGE):
+                state_changed = True
             state["full_scan_cursor"][site_no] = (cursor + len(chunk)) % len(new_dates)
+            state_changed = True
 
-    save_state(state)
+    # 아무것도 안 바뀐 사이클(대부분)에는 state.json을 다시 쓰지 않아 불필요한 디스크 I/O를 피함.
+    if state_changed:
+        save_state(state)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="IMAX 예매 오픈/취소표 감시 봇")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--only-open", action="store_true", help="신규 상영(예매 오픈) 감지만 실행 (취소표 감시 끔)"
+    )
+    mode.add_argument(
+        "--only-cancel", action="store_true", help="취소표(잔여좌석 증가) 감지만 실행 (오픈 감시 끔)"
+    )
+    return parser.parse_args()
 
 
 def main():
+    args = parse_args()
+    watch_open = not args.only_cancel
+    watch_cancel = not args.only_open
+
     config = load_config()
     state = load_state()
 
@@ -352,19 +415,34 @@ def main():
     cancel_check_interval = config.get("cancel_check_interval_sec", 8)
     full_scan_interval = config.get("full_scan_interval_sec", 30)
     full_scan_chunk_size = config.get("full_scan_chunk_size", 10)
-    log.info(
-        f"감시 시작 (취소표 확인 주기: {cancel_check_interval}s, "
-        f"전체 오픈 재검사 주기: {full_scan_interval}s, 회당 {full_scan_chunk_size}일씩 순환 조회)"
+    if watch_open and watch_cancel:
+        mode_desc = "오픈+취소표 감지"
+    elif watch_open:
+        mode_desc = "오픈 감지만"
+    else:
+        mode_desc = "취소표 감지만"
+
+    # cancel_check_interval은 취소표 감시뿐 아니라 폴링 루프 자체의 주기이기도 해서
+    # (added dates 확인이 매 사이클 돈다) watch_cancel이 꺼져 있어도 의미는 있지만,
+    # 그 경우 "취소표 확인 주기"라는 라벨은 오해를 주므로 "폴링 주기"로 바꿔 표기.
+    poll_label = "취소표 확인 주기" if watch_cancel else "폴링 주기"
+    full_scan_desc = (
+        f", 전체 오픈 재검사 주기: {full_scan_interval}s, 회당 {full_scan_chunk_size}일씩 순환 조회"
+        if watch_open
+        else ""
     )
+    log.info(f"감시 시작 ({mode_desc}, {poll_label}: {cancel_check_interval}s{full_scan_desc})")
 
     last_full_scan = None  # None -> 시작 직후 1회는 무조건 첫 청크 조회
     next_full_scan_interval = full_scan_interval  # 매번 지터를 넣어 재계산되는 실제 대기 시간
 
     while True:
         now = time.monotonic()
-        do_full_scan = last_full_scan is None or (now - last_full_scan) >= next_full_scan_interval
+        do_full_scan = watch_open and (
+            last_full_scan is None or (now - last_full_scan) >= next_full_scan_interval
+        )
         try:
-            poll_once(config, state, do_full_scan)
+            poll_once(config, state, do_full_scan, watch_open=watch_open, watch_cancel=watch_cancel)
             if do_full_scan:
                 last_full_scan = now
                 next_full_scan_interval = full_scan_interval * random.uniform(

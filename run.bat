@@ -1,4 +1,4 @@
 @echo off
 cd /d "%~dp0"
-python watcher.py
+python watcher.py %*
 pause
