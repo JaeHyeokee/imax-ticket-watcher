@@ -229,7 +229,7 @@ def _send_telegram_sync(config, text):
         log.error(f"텔레그램 알림 전송 실패: {e}")
 
 
-def scan_dates(config, state, theater, dates, notify, jitter_range=CANCEL_JITTER_RANGE, parallel=False):
+def scan_dates(config, state, theater, dates, notify_open, notify_cancel, jitter_range=CANCEL_JITTER_RANGE, parallel=False):
     site_no = theater["site_no"]
     name = theater["name"]
     screen_keywords = config.get("screens", ["IMAX"])
@@ -266,7 +266,7 @@ def scan_dates(config, state, theater, dates, notify, jitter_range=CANCEL_JITTER
 
             if key not in state["seen"]:
                 state["seen"].add(key)
-                if notify and free > min_alert_seats:
+                if notify_open and free > min_alert_seats:
                     text = format_notification(name, session)
                     date_fmt, time_fmt = format_datetime(session)
                     log.info(f"새 상영 발견 -> {name} {session.get('movNm')} {date_fmt} {time_fmt}")
@@ -274,7 +274,7 @@ def scan_dates(config, state, theater, dates, notify, jitter_range=CANCEL_JITTER
             else:
                 prev = prev_seat_count if prev_seat_count is not None else free
                 if free > prev:
-                    if notify and free > min_alert_seats:
+                    if notify_cancel and free > min_alert_seats:
                         text = format_cancel_notification(name, session, prev, free)
                         date_fmt, time_fmt = format_datetime(session)
                         log.info(
@@ -309,7 +309,7 @@ def initialize(config, state):
         site_no = theater["site_no"]
         dates = get_open_dates(site_no)
         state["open_dates"][site_no] = dates
-        scan_dates(config, state, theater, dates, notify=False)
+        scan_dates(config, state, theater, dates, notify_open=False, notify_cancel=False)
     state["initialized"] = True
     save_state(state)
     log.info("초기화 완료. 이제부터 새로운 상영이 열리면 알림을 보냅니다.")
@@ -363,14 +363,17 @@ def poll_once(config, state, do_full_scan, watch_open=True, watch_cancel=True):
 
         if watch_open and added:
             log.info(f"{theater['name']}: 예매 가능 날짜 확장 감지 {added}")
-            if scan_dates(config, state, theater, added, notify=True):
+            if scan_dates(config, state, theater, added, notify_open=watch_open, notify_cancel=watch_cancel):
                 state_changed = True
 
         # 취소표 감시: 이미 감시 대상으로 확인된 날짜만 빠르게 재확인 (요청 적음 -> 짧은 주기로 실행)
         # 날짜 수가 많아지면 순차 조회로는 한 바퀴가 길어지므로 소수의 동시 요청으로 병렬 처리.
         active_dates = state["active_dates"].get(site_no, [])
         if watch_cancel and active_dates:
-            if scan_dates(config, state, theater, active_dates, notify=True, parallel=True):
+            if scan_dates(
+                config, state, theater, active_dates,
+                notify_open=watch_open, notify_cancel=watch_cancel, parallel=True,
+            ):
                 state_changed = True
 
         # 오픈 감시: 예매 가능한 전체 기간을 다시 훑어서 놓친 신규 상영이 없는지 확인
@@ -379,7 +382,10 @@ def poll_once(config, state, do_full_scan, watch_open=True, watch_cancel=True):
             chunk_size = config.get("full_scan_chunk_size", 10)
             cursor = state["full_scan_cursor"].get(site_no, 0) % len(new_dates)
             chunk = (new_dates[cursor:] + new_dates[:cursor])[:chunk_size]
-            if scan_dates(config, state, theater, chunk, notify=True, jitter_range=FULL_SCAN_JITTER_RANGE):
+            if scan_dates(
+                config, state, theater, chunk,
+                notify_open=watch_open, notify_cancel=watch_cancel, jitter_range=FULL_SCAN_JITTER_RANGE,
+            ):
                 state_changed = True
             state["full_scan_cursor"][site_no] = (cursor + len(chunk)) % len(new_dates)
             state_changed = True
