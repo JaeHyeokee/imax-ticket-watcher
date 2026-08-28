@@ -89,10 +89,33 @@ FULL_SCAN_INTERVAL_JITTER_RATIO = 0.35
 # 작은 값으로 제한.
 CANCEL_MAX_WORKERS = 4
 
+# fetch_json이 재시도를 다 소진하고도 실패한 횟수(성공하면 0으로 리셋)가 이 값 이상
+# 연속되면 CGV 서버 장애나 접속 차단 가능성으로 보고 폴링 주기를 늘리고 텔레그램으로
+# 알림. 극장 하나 조회가 일시적으로 흔들리는 정도로는 잘 안 넘도록 충분히 높게 잡음.
+CONSECUTIVE_FAILURE_ALERT_THRESHOLD = 10
+FAILURE_BACKOFF_MULTIPLIER = 4  # 실패가 계속되는 동안 폴링 주기를 이 배수만큼 늘림
+FAILURE_BACKOFF_MAX_SEC = 300  # 백오프 상한 (5분) — 무한정 늘어나지 않게 캡
+
+_consecutive_failures_lock = threading.Lock()
+_consecutive_failures = 0
+
 
 def request_jitter(jitter_range=CANCEL_JITTER_RANGE):
     """연속 요청 사이에 랜덤 딜레이를 줘서 짧은 시간에 요청이 몰리는 것을 완화."""
     time.sleep(random.uniform(*jitter_range))
+
+
+def _record_fetch_result(success):
+    """fetch_json 성공/실패를 전역 연속 실패 카운터에 반영하고 갱신된 값을 반환.
+    parallel=True인 취소표 재확인에서 여러 스레드가 동시에 호출할 수 있어 lock으로 보호."""
+    global _consecutive_failures
+    with _consecutive_failures_lock:
+        _consecutive_failures = 0 if success else _consecutive_failures + 1
+        return _consecutive_failures
+
+
+def get_consecutive_failures():
+    return _consecutive_failures
 
 
 def fetch_json(url, retries=3, timeout=10):
@@ -100,10 +123,15 @@ def fetch_json(url, retries=3, timeout=10):
     for attempt in range(1, retries + 1):
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except (urllib.error.URLError, TimeoutError) as e:
+                result = json.loads(resp.read().decode("utf-8"))
+            _record_fetch_result(success=True)
+            return result
+        except (urllib.error.URLError, TimeoutError, ValueError) as e:
+            # ValueError는 json.JSONDecodeError/UnicodeDecodeError 포함 — 차단 시 CGV가
+            # JSON 대신 HTML 안내 페이지 등을 돌려주는 경우도 재시도 대상으로 잡기 위함.
             log.warning(f"요청 실패 ({attempt}/{retries}): {url} - {e}")
             time.sleep(2 * attempt)
+    _record_fetch_result(success=False)
     return None
 
 
@@ -198,7 +226,6 @@ def format_cancel_notification(theater_name, session, prev_free, new_free):
     date_fmt, time_fmt = format_datetime(session)
     movie = session.get("movNm", "")
     screen = session.get("scnsNm", "")
-    total = session.get("stcnt", "?")
     freed = new_free - prev_free
     return (
         f"🎟 취소표 발생!\n"
@@ -441,6 +468,7 @@ def main():
 
     last_full_scan = None  # None -> 시작 직후 1회는 무조건 첫 청크 조회
     next_full_scan_interval = full_scan_interval  # 매번 지터를 넣어 재계산되는 실제 대기 시간
+    alerted_failure = False  # 연속 실패 알림을 한 번만 보내고, 복구 알림도 한 번만 보내기 위한 엣지 트리거
 
     while True:
         now = time.monotonic()
@@ -457,7 +485,27 @@ def main():
         except Exception as e:
             log.exception(f"폴링 중 오류 발생: {e}")
 
-        sleep_for = cancel_check_interval * random.uniform(
+        # 연속 실패가 임계치를 넘으면 CGV 서버 장애/접속 차단 가능성으로 보고 폴링 주기를
+        # 늘려서 계속 두드리지 않게 하고, 텔레그램으로 한 번만 알림(복구되면 복구 알림도 한 번).
+        failures = get_consecutive_failures()
+        if failures >= CONSECUTIVE_FAILURE_ALERT_THRESHOLD:
+            if not alerted_failure:
+                log.error(f"연속 {failures}회 요청 실패 - CGV 서버 장애 또는 접속 차단 가능성")
+                send_telegram(
+                    config,
+                    f"⚠️ 감시가 연속 {failures}회 실패하고 있습니다. CGV 접속이 일시적으로 "
+                    f"막혔거나 서버에 문제가 있을 수 있어요. 폴링 주기를 늘려서 계속 재시도합니다.",
+                )
+                alerted_failure = True
+            base_interval = min(cancel_check_interval * FAILURE_BACKOFF_MULTIPLIER, FAILURE_BACKOFF_MAX_SEC)
+        else:
+            if alerted_failure:
+                log.info("요청이 다시 정상적으로 성공했습니다.")
+                send_telegram(config, "✅ 감시가 다시 정상적으로 동작합니다.")
+                alerted_failure = False
+            base_interval = cancel_check_interval
+
+        sleep_for = base_interval * random.uniform(
             1 - CANCEL_INTERVAL_JITTER_RATIO, 1 + CANCEL_INTERVAL_JITTER_RATIO
         )
         time.sleep(sleep_for)
